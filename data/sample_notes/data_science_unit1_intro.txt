@@ -1,0 +1,40 @@
+RGPV B.Tech - Data Science (Semester 5)
+Unit 1: Introduction to Data Science
+
+1. Definition of Data Science
+Data Science is an interdisciplinary field that uses scientific methods, algorithms, and systems to extract knowledge and insights from structured and unstructured data. It combines statistics, computer science, and domain expertise.
+
+2. Data Science Lifecycle
+- Problem Definition: Understand the business or research question.
+- Data Collection: Gather data from databases, APIs, files, or sensors.
+- Data Cleaning: Handle missing values, outliers, and inconsistencies.
+- Exploratory Data Analysis (EDA): Visualize and summarize data patterns.
+- Feature Engineering: Create meaningful input variables for models.
+- Modeling: Apply machine learning or statistical techniques.
+- Evaluation: Measure performance using metrics like accuracy, precision, recall, F1-score.
+- Deployment: Integrate models into production systems.
+
+3. Types of Data
+- Structured Data: Organized in rows and columns (e.g., SQL tables, CSV files).
+- Unstructured Data: Text, images, audio, video without fixed schema.
+- Semi-structured Data: JSON, XML with some organizational structure.
+
+4. Key Python Libraries for Data Science
+- NumPy: Numerical computing and array operations.
+- Pandas: Data manipulation and analysis with DataFrames.
+- Matplotlib & Seaborn: Data visualization.
+- Scikit-learn: Machine learning algorithms and preprocessing.
+- TensorFlow/PyTorch: Deep learning frameworks.
+
+5. Important Exam Questions
+Q1. What is Data Science? Explain its lifecycle with a diagram.
+Q2. Differentiate between structured and unstructured data with examples.
+Q3. List and explain the key Python libraries used in Data Science.
+Q4. What is Exploratory Data Analysis? Why is it important?
+Q5. Define overfitting and underfitting in machine learning.
+
+6. Viva Questions
+- What is the difference between data mining and data science?
+- Explain the role of a data scientist in an organization.
+- What is a DataFrame in Pandas?
+- Name three evaluation metrics for classification problems.
