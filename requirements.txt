@@ -1,28 +1,22 @@
 # Core Framework
-
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-streamlit==1.41.1
 python-dotenv==1.0.1
 pydantic==2.10.4
 pydantic-settings==2.7.1
 
 # Database
-
 sqlalchemy==2.0.36
 alembic==1.14.0
 
 # Authentication
-
 pyjwt==2.10.1
 bcrypt==4.2.1
 
 # Redis
-
 redis==5.2.1
 
-# LangChain / LLM
-
+# LangChain / Gemini
 langchain==0.3.14
 langchain-community==0.3.14
 langchain-google-genai==2.0.8
@@ -31,24 +25,18 @@ langchain-text-splitters==0.3.5
 langgraph==0.2.62
 google-generativeai==0.8.4
 
-# Embeddings & Reranking
-
+# Embeddings & Retrieval
 sentence-transformers==3.3.1
-torch>=2.12.1
-
-# Vector Database
-
+torch>=2.6.0
 chromadb>=1.0.0
 
 # Document Processing
-
 pypdf==5.1.0
 python-pptx==1.0.2
 python-docx==1.1.2
 chardet==5.2.0
 
 # API & Networking
-
 python-multipart==0.0.20
 aiofiles==24.1.0
 httpx==0.28.1
@@ -57,20 +45,16 @@ starlette==0.41.3
 sse-starlette==2.2.1
 
 # Monitoring
-
 prometheus-client==0.21.1
 
 # Security
-
 slowapi==0.1.9
 limits
 
 # Utilities
-
 loguru==0.7.3
 tenacity==9.0.0
 tiktoken==0.8.0
 tqdm==4.67.1
 numpy>=2.0.0
 pandas==2.2.3
-plotly==5.24.1
