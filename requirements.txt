@@ -58,5 +58,7 @@ loguru==0.7.3
 tenacity==9.0.0
 tiktoken==0.8.0
 tqdm==4.67.1
-numpy>=2.0.0
-pandas==2.2.3
+
+numpy==1.26.4
+pandas==2.2.2
+plotly==5.24.1
