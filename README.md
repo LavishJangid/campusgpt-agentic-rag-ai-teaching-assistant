@@ -1,5 +1,8 @@
 # CampusGPT — Production RAG AI Teaching Assistant
 
+Frontend (Streamlit): https://campusgpt-ui.onrender.com
+Backend (FastAPI): https://campusgpt-agentic-rag-ai-teaching.onrender.com
+
 > **Flagship Applied AI / ML Engineering portfolio project** for RGPV university students.  
 > Retrieval-Augmented Generation (RAG) system with JWT auth, Redis memory, CrossEncoder reranking, LangGraph agents, and RAGAS evaluation.
 
