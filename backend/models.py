@@ -141,7 +141,8 @@ class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "healthy"
     version: str = "1.0.0"
-    vector_store_docs: int = 0
+    vector_store_docs: Optional[int] = None
+    vector_store_collection: Optional[str] = None
     environment: str = "development"
 
 

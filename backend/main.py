@@ -30,8 +30,7 @@ from backend.database.services import (
     save_uploaded_document,
 )
 from backend.database.session import get_db, init_db
-from backend.evaluation import RAGASEvaluator
-from backend.ingestion.pipeline import IngestionPipeline
+from threading import Lock, RLock
 from backend.memory import ConversationMemory
 from backend.models import (
     ChatRequest,
@@ -46,21 +45,23 @@ from backend.models import (
     IngestResponse,
     MetricsResponse,
 )
-from backend.rag.engine import RAGEngine
 
 settings = get_settings()
 
-rag_engine: RAGEngine | None = None
-ingestion_pipeline: IngestionPipeline | None = None
+rag_engine = None
+ingestion_pipeline = None
 conversation_memory: ConversationMemory | None = None
-ragas_evaluator: RAGASEvaluator | None = None
+
+ragas_evaluator = None
+_ragas_lock = Lock()
+_resources_lock = RLock()
 
 limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global rag_engine, ingestion_pipeline, conversation_memory, ragas_evaluator
+    global conversation_memory
 
     logger.info("Starting CampusGPT...")
 
@@ -72,14 +73,94 @@ async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized")
 
-    rag_engine = RAGEngine()
-    ingestion_pipeline = IngestionPipeline()
-    conversation_memory = ConversationMemory(max_messages=50)
-    ragas_evaluator = RAGASEvaluator()
+    # Conversation, Redis, and ML resources are lazy. Health reads only the
+    # configured Chroma collection count; it does not start the RAG engine.
+    logger.info("Core systems initialized; optional resources are lazy")
 
-    logger.info("All systems initialized")
     yield
+
     logger.info("Shutting down CampusGPT...")
+
+
+def get_rag_engine():
+    """Create the shared RAG engine and vector resources on first use."""
+    global rag_engine
+    if rag_engine is None:
+        with _resources_lock:
+            if rag_engine is None:
+                from backend.rag.engine import RAGEngine
+
+                rag_engine = RAGEngine()
+                logger.info("RAG Engine initialized")
+    return rag_engine
+
+
+def get_ingestion_pipeline():
+    """Create ingestion with the exact embedding and Chroma instances used by RAG."""
+    global ingestion_pipeline
+    if ingestion_pipeline is None:
+        with _resources_lock:
+            if ingestion_pipeline is None:
+                from backend.ingestion.pipeline import IngestionPipeline
+
+                engine = get_rag_engine()
+                ingestion_pipeline = IngestionPipeline(
+                    embedding_generator=engine.embedding_generator,
+                    vector_store=engine.vector_store,
+                )
+                logger.info("Ingestion pipeline initialized")
+    return ingestion_pipeline
+
+
+def get_conversation_memory():
+    global conversation_memory
+    if conversation_memory is None:
+        with _resources_lock:
+            if conversation_memory is None:
+                conversation_memory = ConversationMemory(max_messages=50)
+    return conversation_memory
+
+
+def get_ragas_evaluator():
+    global ragas_evaluator
+
+    if ragas_evaluator is None:
+        with _ragas_lock:
+            if ragas_evaluator is None:
+                from backend.evaluation import RAGASEvaluator
+
+                logger.info("Initializing RAGAS evaluator...")
+                ragas_evaluator = RAGASEvaluator()
+
+    return ragas_evaluator
+
+
+def get_active_vector_collection_name() -> str:
+    """Resolve the collection from configuration without loading an embedder."""
+    from backend.ingestion.embeddings import collection_name_for_embedding
+
+    model_name = (
+        settings.gemini_embedding_model
+        if settings.embedding_provider.lower() == "gemini"
+        else settings.embedding_model
+    )
+    return collection_name_for_embedding(
+        settings.chroma_collection_name,
+        settings.embedding_provider,
+        model_name,
+    )
+
+
+def get_active_vector_collection_count() -> tuple[str, int]:
+    """Read the active Chroma collection without initializing RAG or embeddings."""
+    from backend.vectorstore.chroma_store import get_existing_collection_count
+
+    collection_name = get_active_vector_collection_name()
+    count = get_existing_collection_count(
+        settings.chroma_persist_dir,
+        collection_name,
+    )
+    return collection_name, count
 
 
 app = FastAPI(
@@ -123,17 +204,29 @@ async def root():
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
-async def health_check():
+def health_check():
+    collection_name = get_active_vector_collection_name()
     try:
-        doc_count = rag_engine.vector_store.get_collection_stats().get("total_chunks", 0) if rag_engine else 0
-        return HealthResponse(
-            status="healthy",
-            version=settings.app_version,
-            vector_store_docs=doc_count,
-            environment=settings.app_env,
+        collection_name, document_count = get_active_vector_collection_count()
+    except Exception as exc:
+        logger.warning("Health check could not query ChromaDB ({})", type(exc).__name__)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "version": settings.app_version,
+                "vector_store_docs": None,
+                "vector_store_collection": collection_name,
+                "environment": settings.app_env,
+            },
         )
-    except Exception as e:
-        return HealthResponse(status=f"degraded: {e}", version=settings.app_version)
+    return {
+        "status": "healthy",
+        "version": settings.app_version,
+        "vector_store_docs": document_count,
+        "vector_store_collection": collection_name,
+        "environment": settings.app_env,
+    }
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
@@ -144,8 +237,7 @@ async def chat(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="RAG Engine not initialized")
+    engine = get_rag_engine()
 
     question = chat_request.question.strip()
     if not question:
@@ -153,11 +245,12 @@ async def chat(
     if len(question) > 5000:
         raise HTTPException(status_code=400, detail="Question too long (max 5000 chars)")
 
-    history = conversation_memory.get_history(chat_request.session_id)
+    memory = get_conversation_memory()
+    history = memory.get_history(chat_request.session_id)
     mode = chat_request.mode.lower()
 
     if mode == "exam_prep":
-        result = rag_engine.exam_preparation(
+        result = engine.exam_preparation(
             subject=chat_request.subject, topic=chat_request.topic, unit=chat_request.unit
         )
         answer, sources, response_time = result["content"], [
@@ -165,7 +258,7 @@ async def chat(
             for s in result.get("sources", [])
         ], result["response_time"]
     elif mode == "quiz":
-        result = rag_engine.generate_quiz(
+        result = engine.generate_quiz(
             subject=chat_request.subject,
             topic=chat_request.topic,
             difficulty=chat_request.difficulty,
@@ -175,7 +268,7 @@ async def chat(
         sources = [{"source": s, "page_number": 0, "similarity_score": 0, "citation_label": s} for s in result.get("sources", [])]
         response_time = result["response_time"]
     elif mode == "viva":
-        result = rag_engine.generate_viva_questions(
+        result = engine.generate_viva_questions(
             subject=chat_request.subject,
             topic=chat_request.topic,
             num_questions=chat_request.num_questions,
@@ -184,19 +277,19 @@ async def chat(
         sources = [{"source": s, "page_number": 0, "similarity_score": 0, "citation_label": s} for s in result.get("sources", [])]
         response_time = result["response_time"]
     elif mode == "assignment":
-        result = rag_engine.assignment_help(question=question, subject=chat_request.subject)
+        result = engine.assignment_help(question=question, subject=chat_request.subject)
         answer = result["answer"]
         sources = result.get("sources", [])
         response_time = result["response_time"]
     elif mode == "important_questions":
-        result = rag_engine.find_important_questions(
+        result = engine.find_important_questions(
             subject=chat_request.subject, unit=chat_request.unit
         )
         answer = result["questions"]
         sources = [{"source": s, "page_number": 0, "similarity_score": 0, "citation_label": s} for s in result.get("sources", [])]
         response_time = result["response_time"]
     else:
-        result = rag_engine.chat(
+        result = engine.chat(
             question=question,
             chat_history=history,
             subject=chat_request.subject,
@@ -212,7 +305,7 @@ async def chat(
         sources = result["sources"]
         response_time = result["response_time"]
 
-    conversation_memory.add_exchange(chat_request.session_id, question, answer)
+    memory.add_exchange(chat_request.session_id, question, answer)
     save_chat_message(db, chat_request.session_id, "user", question, user.id, mode)
     save_chat_message(db, chat_request.session_id, "assistant", answer, user.id, mode)
     log_analytics(db, "chat", user.id, {"mode": mode, "session_id": chat_request.session_id})
@@ -241,8 +334,7 @@ async def ingest_document(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not ingestion_pipeline:
-        raise HTTPException(status_code=503, detail="Ingestion pipeline not initialized")
+    pipeline = get_ingestion_pipeline()
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
@@ -256,8 +348,14 @@ async def ingest_document(
         raise HTTPException(status_code=400, detail=f"File too large: {size_mb:.1f}MB")
 
     try:
-        file_path = ingestion_pipeline.save_upload(content, file.filename)
-        result = ingestion_pipeline.ingest_file(
+        duplicate_result = pipeline.check_existing_content(file.filename, content)
+        if duplicate_result and duplicate_result.get("status") == "conflict":
+            raise HTTPException(status_code=409, detail=duplicate_result.get("message"))
+        if duplicate_result and duplicate_result.get("status") == "skipped":
+            return IngestResponse(**duplicate_result)
+
+        file_path = pipeline.save_upload(content, file.filename)
+        result = pipeline.ingest_file(
             file_path=file_path,
             subject=subject,
             semester=semester,
@@ -266,6 +364,12 @@ async def ingest_document(
             document_type=document_type,
             course=course,
         )
+        if result.get("status") == "conflict":
+            raise HTTPException(status_code=409, detail=result.get("message"))
+        if result.get("status") in {"skipped", "warning"}:
+            return IngestResponse(**result)
+        if result.get("status") != "success":
+            raise HTTPException(status_code=500, detail=result.get("message", "Ingestion failed"))
         save_uploaded_document(
             db,
             source=result.get("source", file.filename),
@@ -282,16 +386,16 @@ async def ingest_document(
         )
         log_analytics(db, "ingest", user.id, {"source": file.filename})
         return IngestResponse(**result)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Ingestion error: {e}")
+        logger.exception("Ingestion failed for '{}'", file.filename)
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {e}")
 
 
 @app.get("/documents", response_model=DocumentListResponse, tags=["Documents"])
 async def list_documents(user: User = Depends(get_current_user)):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    stats = rag_engine.vector_store.get_collection_stats()
+    stats = get_rag_engine().vector_store.get_collection_stats()
     return DocumentListResponse(
         documents=stats.get("documents", []),
         total_documents=stats.get("total_documents", 0),
@@ -305,9 +409,7 @@ async def delete_document(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    deleted_count = rag_engine.vector_store.delete_by_source(request.source)
+    deleted_count = get_rag_engine().vector_store.delete_by_source(request.source)
     if deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"Document not found: {request.source}")
     upload_path = os.path.join(settings.upload_dir, request.source)
@@ -323,9 +425,7 @@ async def delete_document(
 
 @app.get("/metrics", response_model=MetricsResponse, tags=["Analytics"])
 async def get_metrics(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    engine_metrics = rag_engine.get_metrics()
+    engine_metrics = get_rag_engine().get_metrics()
     vs_stats = engine_metrics.get("vector_store_stats", {})
     return MetricsResponse(
         total_queries=engine_metrics.get("total_queries", 0),
@@ -368,13 +468,13 @@ async def run_evaluation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not rag_engine or not ragas_evaluator:
-        raise HTTPException(status_code=503, detail="Evaluation not available")
+    engine = get_rag_engine()
+    evaluator = get_ragas_evaluator()
 
     start = time.time()
-    result = rag_engine.chat(question=payload.question, chat_history=[])
+    result = engine.chat(question=payload.question, chat_history=[])
     contexts = [s.get("text_preview", "") for s in result.get("sources", [])]
-    eval_scores = ragas_evaluator.evaluate(
+    eval_scores = evaluator.evaluate(
         question=payload.question,
         answer=result["answer"],
         contexts=contexts or ["No context retrieved"],
@@ -432,32 +532,24 @@ async def evaluation_history(
 
 @app.get("/chat/history/{session_id}", tags=["Chat"])
 async def get_chat_history(session_id: str, user: User = Depends(get_current_user)):
-    if not conversation_memory:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    history = conversation_memory.get_history(session_id)
+    history = get_conversation_memory().get_history(session_id)
     return {"session_id": session_id, "messages": history, "count": len(history)}
 
 
 @app.delete("/chat/history/{session_id}", tags=["Chat"])
 async def clear_chat_history(session_id: str, user: User = Depends(get_current_user)):
-    if not conversation_memory:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    conversation_memory.clear_session(session_id)
+    get_conversation_memory().clear_session(session_id)
     return {"status": "success", "message": f"Cleared history for session: {session_id}"}
 
 
 @app.get("/chat/export/{session_id}", tags=["Chat"])
 async def export_chat(session_id: str, user: User = Depends(get_current_user)):
-    if not conversation_memory:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    return {"session_id": session_id, "export": conversation_memory.export_chat(session_id)}
+    return {"session_id": session_id, "export": get_conversation_memory().export_chat(session_id)}
 
 
 @app.get("/search/topic/{topic}", tags=["Search"])
 async def search_by_topic(topic: str, top_k: int = 10, user: User = Depends(get_current_user)):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    results = rag_engine.search_by_topic(topic, top_k=top_k)
+    results = get_rag_engine().search_by_topic(topic, top_k=top_k)
     return {"topic": topic, "results": results, "count": len(results)}
 
 
@@ -465,9 +557,7 @@ async def search_by_topic(topic: str, top_k: int = 10, user: User = Depends(get_
 async def search_by_subject(
     subject: str, query: str = "", top_k: int = 10, user: User = Depends(get_current_user)
 ):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    results = rag_engine.search_by_subject(subject, query=query, top_k=top_k)
+    results = get_rag_engine().search_by_subject(subject, query=query, top_k=top_k)
     return {"subject": subject, "results": results, "count": len(results)}
 
 
@@ -475,9 +565,7 @@ async def search_by_subject(
 async def search_by_semester(
     semester: str, query: str = "", top_k: int = 10, user: User = Depends(get_current_user)
 ):
-    if not rag_engine:
-        raise HTTPException(status_code=503, detail="System not initialized")
-    results = rag_engine.search_by_semester(semester, query=query, top_k=top_k)
+    results = get_rag_engine().search_by_semester(semester, query=query, top_k=top_k)
     return {"semester": semester, "results": results, "count": len(results)}
 
 

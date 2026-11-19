@@ -12,7 +12,10 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+BACKEND_URL = (os.getenv("BACKEND_URL") or "http://localhost:8000").strip().rstrip("/")
+API_CONNECT_TIMEOUT_SECONDS = 5
+CHAT_READ_TIMEOUT_SECONDS = 120
+INGEST_READ_TIMEOUT_SECONDS = 300
 
 st.set_page_config(
     page_title="CampusGPT",
@@ -93,15 +96,23 @@ def api_headers():
 
 
 def api_get(path, **kwargs):
-    return requests.get(f"{BACKEND_URL}{path}", headers=api_headers(), timeout=kwargs.pop("timeout", 30), **kwargs)
+    timeout = kwargs.pop("timeout", (API_CONNECT_TIMEOUT_SECONDS, 30))
+    return requests.get(f"{BACKEND_URL}{path}", headers=api_headers(), timeout=timeout, **kwargs)
 
 
 def api_post(path, **kwargs):
-    return requests.post(f"{BACKEND_URL}{path}", headers=api_headers(), timeout=kwargs.pop("timeout", 120), **kwargs)
+    read_timeout = (
+        CHAT_READ_TIMEOUT_SECONDS
+        if path in {"/chat", "/evaluation"}
+        else 30
+    )
+    timeout = kwargs.pop("timeout", (API_CONNECT_TIMEOUT_SECONDS, read_timeout))
+    return requests.post(f"{BACKEND_URL}{path}", headers=api_headers(), timeout=timeout, **kwargs)
 
 
 def api_delete(path, **kwargs):
-    return requests.delete(f"{BACKEND_URL}{path}", headers=api_headers(), timeout=kwargs.pop("timeout", 30), **kwargs)
+    timeout = kwargs.pop("timeout", (API_CONNECT_TIMEOUT_SECONDS, 30))
+    return requests.delete(f"{BACKEND_URL}{path}", headers=api_headers(), timeout=timeout, **kwargs)
 
 
 # ── Auth UI ───────────────────────────────────────────────────────────────────
@@ -315,6 +326,19 @@ if menu == "💬 Chat":
                         st.rerun()
                     else:
                         st.error(f"Error {r.status_code}: {r.text}")
+                except requests.exceptions.ReadTimeout:
+                    st.session_state.typing = False
+                    st.error(
+                        "The backend did not finish this chat within 120 seconds. "
+                        "Render may be waking the service or Gemini may be slow. "
+                        "The request may still have completed; check the conversation before retrying."
+                    )
+                except requests.exceptions.ConnectionError:
+                    st.session_state.typing = False
+                    st.error(
+                        f"The backend is not accepting connections yet. Check "
+                        f"{BACKEND_URL}/health after the Render service wakes, then retry."
+                    )
                 except Exception as e:
                     st.session_state.typing = False
                     st.error(f"Backend error: {e}")
@@ -378,13 +402,23 @@ elif menu == "📤 Upload":
                                 headers=api_headers(),
                                 files={"file": (f.name, f.getvalue(), f.type)},
                                 data={"subject": subj, "semester": sem, "unit": unit, "topic": top, "document_type": dtype, "course": course},
-                                timeout=300,
+                                timeout=(API_CONNECT_TIMEOUT_SECONDS, INGEST_READ_TIMEOUT_SECONDS),
                             )
                             if r.status_code == 200:
                                 res = r.json()
                                 st.success(f"Ingested {res['chunks']} chunks from {res['source']}")
                             else:
                                 st.error(r.text)
+                        except requests.exceptions.ReadTimeout:
+                            st.error(
+                                "The upload did not finish within 300 seconds. "
+                                "Check the Documents list before retrying; ingestion may have completed."
+                            )
+                        except requests.exceptions.ConnectionError:
+                            st.error(
+                                f"The backend is waking or unavailable. Check "
+                                f"{BACKEND_URL}/health, then retry the upload."
+                            )
                         except Exception as e:
                             st.error(str(e))
                 else:
@@ -458,7 +492,7 @@ elif menu == "⚙️ Admin":
                     st.dataframe(pd.DataFrame(docs), use_container_width=True)
                     to_del = st.selectbox("Delete document", [d["source"] for d in docs])
                     if st.button("Delete", type="primary"):
-                        resp = requests.request("DELETE", f"{BACKEND_URL}/documents", headers=api_headers(), json={"source": to_del})
+                        resp = requests.request("DELETE", f"{BACKEND_URL}/documents", headers=api_headers(), json={"source": to_del}, timeout=(API_CONNECT_TIMEOUT_SECONDS, 30))
                         if resp.status_code == 200:
                             st.success("Deleted")
                             st.rerun()

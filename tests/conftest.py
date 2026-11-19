@@ -7,8 +7,11 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+import chromadb
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_REAL_CHROMA_PERSISTENT_CLIENT = chromadb.PersistentClient
 
 os.environ["APP_ENV"] = "test"
 os.environ["GEMINI_API_KEY"] = "mock_key"
@@ -96,6 +99,16 @@ def mock_dependencies(monkeypatch):
     mock_chroma_client = MagicMock()
     mock_chroma_client.get_or_create_collection.return_value = mock_collection
     monkeypatch.setattr("chromadb.PersistentClient", MagicMock(return_value=mock_chroma_client))
+
+
+@pytest.fixture(autouse=True)
+def reset_chroma_client_cache(mock_dependencies):
+    """Keep the shared-client production behavior isolated between unit tests."""
+    from backend.vectorstore.chroma_store import _CLIENTS
+
+    _CLIENTS.clear()
+    yield
+    _CLIENTS.clear()
 
 
 @pytest.fixture

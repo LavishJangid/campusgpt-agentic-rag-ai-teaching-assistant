@@ -1,10 +1,42 @@
 """ChromaDB vector store implementation with semantic search and metadata filtering."""
 
 import uuid
+from pathlib import Path
+from threading import RLock
 from typing import Optional
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from loguru import logger
+
+_CLIENTS: dict[str, object] = {}
+_CLIENTS_LOCK = RLock()
+
+
+def get_chroma_client(persist_dir: str):
+    """Return one Chroma client per persistence path for health and RAG use."""
+    resolved_path = str(Path(persist_dir).expanduser().resolve())
+    with _CLIENTS_LOCK:
+        client = _CLIENTS.get(resolved_path)
+        if client is None:
+            client = chromadb.PersistentClient(
+                path=resolved_path,
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
+            _CLIENTS[resolved_path] = client
+        return client
+
+
+def get_existing_collection_count(persist_dir: str, collection_name: str) -> int:
+    """Read an existing collection's record count without creating a collection."""
+    client = get_chroma_client(persist_dir)
+    collections = client.list_collections()
+    existing_names = {
+        collection.name if hasattr(collection, "name") else str(collection)
+        for collection in collections
+    }
+    if collection_name not in existing_names:
+        return 0
+    return client.get_collection(name=collection_name).count()
 
 
 class ChromaStore:
@@ -30,10 +62,7 @@ class ChromaStore:
         self.embedding_generator = embedding_generator
 
         # Initialize ChromaDB client with persistence
-        self.client = chromadb.PersistentClient(
-            path=persist_dir,
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
+        self.client = get_chroma_client(persist_dir)
 
         # Get or create collection
         self.collection = self.client.get_or_create_collection(
@@ -67,7 +96,9 @@ class ChromaStore:
         if not texts:
             return []
 
-        # Generate IDs if not provided
+        # Keep ordinary inserts unchanged. Caller-supplied stable IDs use
+        # upsert so retried ingestion does not create duplicate Chroma records.
+        stable_ids = ids is not None
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts]
 
@@ -101,7 +132,10 @@ class ChromaStore:
             if embeddings:
                 add_kwargs["embeddings"] = embeddings[i:batch_end]
 
-            self.collection.add(**add_kwargs)
+            if stable_ids:
+                self.collection.upsert(**add_kwargs)
+            else:
+                self.collection.add(**add_kwargs)
 
         logger.info(f"Added {len(texts)} documents to ChromaDB")
         return ids
@@ -274,6 +308,21 @@ class ChromaStore:
         except Exception as e:
             logger.error(f"Delete failed: {str(e)}")
             return 0
+
+    def get_source_info(self, source: str) -> Optional[dict]:
+        """Return source hash and stored chunk count for safe duplicate handling."""
+        results = self.collection.get(
+            where={"source": {"$eq": source}},
+            include=["metadatas"],
+        )
+        ids = results.get("ids", [])
+        if not ids:
+            return None
+
+        metadata = results.get("metadatas", [])
+        hashes = {item.get("content_hash") for item in metadata if item}
+        content_hash = next(iter(hashes)) if len(hashes) == 1 else None
+        return {"content_hash": content_hash, "chunks": len(ids)}
 
     def get_all_documents(self) -> list[dict]:
         """Get summary of all stored documents."""

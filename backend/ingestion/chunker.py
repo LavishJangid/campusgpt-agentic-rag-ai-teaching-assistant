@@ -91,6 +91,7 @@ class DocumentChunker:
                 "chunk_index": chunk_index,
                 "chunk_size": len(text),
                 "total_pages": metadata.get("total_pages", 0),
+                "content_hash": metadata.get("content_hash", ""),
                 # Educational metadata (populated during ingestion)
                 "subject": metadata.get("subject", ""),
                 "semester": metadata.get("semester", ""),

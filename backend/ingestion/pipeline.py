@@ -1,5 +1,6 @@
 """Complete ingestion pipeline orchestrator."""
 
+import hashlib
 import os
 import time
 import shutil
@@ -21,20 +22,26 @@ class IngestionPipeline:
     Flow: Upload → Load → Clean → Chunk → Embed → Store
     """
 
-    def __init__(self):
+    def __init__(self, embedding_generator=None, vector_store=None):
         self.settings = get_settings()
         self.loader = DocumentLoader()
         self.chunker = DocumentChunker(
             chunk_size=self.settings.chunk_size,
             chunk_overlap=self.settings.chunk_overlap,
         )
-        self.embedding_generator = EmbeddingGenerator(
-            model_name=self.settings.embedding_model
+        self.embedding_generator = (
+            embedding_generator if embedding_generator is not None else EmbeddingGenerator()
         )
-        self.vector_store = ChromaStore(
-            persist_dir=self.settings.chroma_persist_dir,
-            collection_name=self.settings.chroma_collection_name,
-            embedding_generator=self.embedding_generator,
+        self.vector_store = (
+            vector_store
+            if vector_store is not None
+            else ChromaStore(
+                persist_dir=self.settings.chroma_persist_dir,
+                collection_name=self.embedding_generator.collection_name(
+                    self.settings.chroma_collection_name
+                ),
+                embedding_generator=self.embedding_generator,
+            )
         )
 
         # Ensure directories exist
@@ -42,6 +49,34 @@ class IngestionPipeline:
         os.makedirs(self.settings.processed_dir, exist_ok=True)
 
         logger.info("Ingestion pipeline initialized")
+
+    def check_existing_content(self, source: str, content: bytes) -> Optional[dict]:
+        """Return an idempotent-skip or conflict result before saving an upload."""
+        content_hash = hashlib.sha256(content).hexdigest()
+        return self._existing_source_result(Path(source).name, content_hash)
+
+    def _existing_source_result(self, source: str, content_hash: str) -> Optional[dict]:
+        existing = self.vector_store.get_source_info(Path(source).name)
+        if not isinstance(existing, dict):
+            return None
+        if existing.get("content_hash") == content_hash:
+            return {
+                "status": "skipped",
+                "message": "This exact document is already indexed.",
+                "source": Path(source).name,
+                "chunks": existing.get("chunks", 0),
+                "time_seconds": 0,
+            }
+        return {
+            "status": "conflict",
+            "message": (
+                "A different document with this filename is already indexed. "
+                "Delete that document explicitly or upload this file with a new filename."
+            ),
+            "source": Path(source).name,
+            "chunks": 0,
+            "time_seconds": 0,
+        }
 
     def ingest_file(
         self,
@@ -62,9 +97,28 @@ class IngestionPipeline:
         start_time = time.time()
 
         try:
+            source = Path(file_path).name
+            digest = hashlib.sha256()
+            with open(file_path, "rb") as document_file:
+                for block in iter(lambda: document_file.read(1024 * 1024), b""):
+                    digest.update(block)
+            content_hash = digest.hexdigest()
+
+            # Repeated uploads of the same file are idempotent. A changed file
+            # with the same source is rejected so old chunks are never silently
+            # mixed with the new revision or deleted without an explicit action.
+            existing_result = self._existing_source_result(source, content_hash)
+            if existing_result:
+                existing_result["time_seconds"] = round(time.time() - start_time, 2)
+                if existing_result["status"] == "skipped":
+                    logger.info("Skipping already indexed document '{}'", source)
+                return existing_result
+
             # Step 1: Load document
             logger.info(f"Step 1/4: Loading document '{file_path}'")
             doc_data = self.loader.load(file_path)
+            doc_data["metadata"]["source"] = source
+            doc_data["metadata"]["content_hash"] = content_hash
 
             # Inject educational metadata
             doc_data["metadata"]["subject"] = subject
@@ -94,13 +148,17 @@ class IngestionPipeline:
 
             # Step 4: Store in vector database
             logger.info("Step 4/4: Storing in vector database")
-            doc_ids = self.vector_store.add_documents(texts, metadatas)
+            doc_ids = [
+                hashlib.sha256(f"{source}\0{content_hash}\0{index}".encode()).hexdigest()
+                for index in range(len(texts))
+            ]
+            doc_ids = self.vector_store.add_documents(texts, metadatas, ids=doc_ids)
 
             elapsed = round(time.time() - start_time, 2)
             result = {
                 "status": "success",
                 "message": f"Successfully ingested {len(chunks)} chunks",
-                "source": os.path.basename(file_path),
+                "source": source,
                 "chunks": len(chunks),
                 "pages": doc_data["metadata"].get("extracted_pages", 0),
                 "file_type": doc_data["metadata"].get("file_type", "unknown"),
@@ -116,7 +174,7 @@ class IngestionPipeline:
 
         except Exception as e:
             elapsed = round(time.time() - start_time, 2)
-            logger.error(f"Ingestion failed for '{file_path}': {str(e)}")
+            logger.exception("Ingestion failed for '{}'", file_path)
             return {
                 "status": "error",
                 "message": str(e),

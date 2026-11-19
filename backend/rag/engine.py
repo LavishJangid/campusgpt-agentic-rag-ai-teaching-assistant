@@ -31,17 +31,24 @@ class RAGEngine:
     Pipeline: Question → Embedding → Retriever → Top-K → Context → LLM → Answer
     """
 
-    def __init__(self):
+    def __init__(self, embedding_generator=None, vector_store=None):
         self.settings = get_settings()
 
-        # Initialize components
-        self.embedding_generator = EmbeddingGenerator(
-            model_name=self.settings.embedding_model
+        # Dependencies may be supplied by the application resource manager so
+        # ingestion and retrieval use the same model and Chroma collection.
+        self.embedding_generator = (
+            embedding_generator if embedding_generator is not None else EmbeddingGenerator()
         )
-        self.vector_store = ChromaStore(
-            persist_dir=self.settings.chroma_persist_dir,
-            collection_name=self.settings.chroma_collection_name,
-            embedding_generator=self.embedding_generator,
+        self.vector_store = (
+            vector_store
+            if vector_store is not None
+            else ChromaStore(
+                persist_dir=self.settings.chroma_persist_dir,
+                collection_name=self.embedding_generator.collection_name(
+                    self.settings.chroma_collection_name
+                ),
+                embedding_generator=self.embedding_generator,
+            )
         )
 
         # Initialize LLM

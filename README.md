@@ -118,6 +118,68 @@ cp .env.example .env
 python scripts/init_db.py       # Create SQLite tables
 ```
 
+## Render Free memory-conscious configuration
+
+The Render start command remains the one in `Procfile`; this repository has no
+`render.yaml`. Set these values on the backend web service:
+
+| Variable | Value |
+| --- | --- |
+| `APP_ENV` | `production` |
+| `DEBUG` | `false` |
+| `GEMINI_API_KEY` | Your Gemini API key (secret) |
+| `JWT_SECRET_KEY` | A newly generated long random secret (secret) |
+| `EMBEDDING_PROVIDER` | `gemini` |
+| `GEMINI_EMBEDDING_MODEL` | `models/gemini-embedding-001` |
+| `RERANKER_DISABLED` | `true` |
+| `REDIS_ENABLED` | `false` unless a reachable Redis service is configured |
+| `RAGAS_DISABLED` | `true` to use the lightweight heuristic evaluator |
+| `CHROMA_PERSIST_DIR` | `/tmp/campusgpt-chroma` |
+| `CHROMA_COLLECTION_NAME` | `teaching_assistant` |
+| `DATABASE_URL` | `sqlite:////tmp/campusgpt.db` |
+
+On the Streamlit frontend service, set:
+
+| Variable | Value |
+| --- | --- |
+| `BACKEND_URL` | `https://campusgpt-agentic-rag-ai-teaching.onrender.com` |
+
+Do not set `EMBEDDING_MODEL` for the Gemini configuration. It selects the local
+provider model only. Never put API keys in the repository or logs.
+
+The existing local MiniLM collection keeps its configured collection name.
+Gemini embeddings use a separate model-specific collection named
+`teaching_assistant__gemini_models_gemini_embedding_001`. The application does not
+delete the old collection or re-embed documents automatically. Re-upload the
+original documents through `/ingest` or the existing frontend after switching
+providers. Never use one collection for different embedding models.
+`/health` reports the configured active collection name and its actual Chroma
+record count without creating a missing collection or initializing RAG, LLM, or
+embedding models. A Chroma record represents one indexed chunk. A zero count means
+the active collection is empty or absent; it does not search other model collections.
+
+Identical re-uploads are skipped. Uploading changed content under an already
+indexed filename returns HTTP 409 instead of silently duplicating or deleting the
+old version. Use the existing document deletion endpoint explicitly before
+replacing that source.
+
+Render Free filesystems are ephemeral. Chroma data, uploads, and SQLite changes
+can disappear on restart, spin-down, or redeploy. The `/tmp` paths make that
+limitation explicit and do not provide durable storage. Keep original documents
+elsewhere and re-ingest after a reset. Durable local Chroma/SQLite storage needs
+a host or storage service that supports persistent data.
+
+The default install omits PyTorch and sentence-transformers. For local MiniLM
+embeddings or CrossEncoder reranking, install them separately:
+
+```bash
+pip install "sentence-transformers==3.3.1" "torch>=2.6.0"
+```
+
+This optional local stack can exceed a 512 MB process limit. Gemini embeddings
+and disabled reranking are recommended for Render Free. Memory use is workload-
+dependent; this configuration cannot guarantee a specific memory ceiling.
+
 ### Run Locally
 
 ```bash
@@ -181,7 +243,7 @@ docker-compose up --build
 
 1. Go to [share.streamlit.io](https://share.streamlit.io)
 2. Point to `frontend/app.py`
-3. Set `BACKEND_URL` to your Render backend URL
+3. Set `BACKEND_URL` to `https://campusgpt-agentic-rag-ai-teaching.onrender.com`
 
 ---
 
